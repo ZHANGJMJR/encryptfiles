@@ -10,6 +10,8 @@ import fitz  # PyMuPDF
 SECRET_KEY = "MySecretKey123"
 CODE_LENGTH = 24
 AUTH_FILE = "auth_info.json"
+# 新增：记录最近运行时间的文件
+LAST_RUN_FILE = "last_run_time.json"
 LOGO_FILE_NAME = "logo.png"  # Logo文件名
 
 
@@ -17,10 +19,8 @@ LOGO_FILE_NAME = "logo.png"  # Logo文件名
 def get_resource_path(relative_path):
     try:
         if getattr(sys, 'frozen', False):
-            # 打包后路径（兼容PyInstaller的临时目录）
             base_path = sys._MEIPASS
         else:
-            # 开发环境路径
             base_path = os.path.dirname(os.path.abspath(__file__))
         return os.path.normpath(os.path.join(base_path, relative_path))
     except Exception as e:
@@ -37,7 +37,63 @@ def get_logo_path():
     return get_resource_path(LOGO_FILE_NAME)
 
 
-# ---------------- 授权函数 ----------------
+# ---------------- 时间防篡改逻辑（核心新增） ----------------
+def get_last_run_time():
+    """获取最近一次运行的时间戳（精确到分钟）"""
+    try:
+        user_dir = os.path.expanduser("~")
+        last_run_path = os.path.join(user_dir, LAST_RUN_FILE)
+        if os.path.exists(last_run_path):
+            with open(last_run_path, "r") as f:
+                data = json.load(f)
+            # 验证文件未被篡改
+            expected_checksum = hashlib.sha256(f"{data['timestamp']}{SECRET_KEY}".encode()).hexdigest()
+            if data["checksum"] == expected_checksum:
+                return data["timestamp"]
+    except Exception as e:
+        print(f"读取最近运行时间失败: {str(e)}")  # 不弹窗，内部处理
+    return None
+
+
+def update_last_run_time():
+    """更新最近运行时间（精确到分钟，避免频繁写入）"""
+    try:
+        # 精确到分钟（减少写入次数，同时保留防篡改精度）
+        current_ts = int(datetime.datetime.now().timestamp() // 60 * 60)
+        user_dir = os.path.expanduser("~")
+        last_run_path = os.path.join(user_dir, LAST_RUN_FILE)
+        # 加密存储（防止直接修改文件）
+        data = {
+            "timestamp": current_ts,
+            "checksum": hashlib.sha256(f"{current_ts}{SECRET_KEY}".encode()).hexdigest()
+        }
+        with open(last_run_path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"更新最近运行时间失败: {str(e)}")
+
+
+def check_time_tampering():
+    """检查系统时间是否被倒退（防篡改核心）"""
+    current_ts = int(datetime.datetime.now().timestamp())
+    last_ts = get_last_run_time()
+
+    if last_ts is None:
+        # 首次运行，直接记录当前时间
+        update_last_run_time()
+        return True
+
+    # 允许1分钟误差（系统时间同步可能有微小偏差）
+    if current_ts < last_ts - 60:
+        # 系统时间比上次运行时间早，判定为被篡改
+        return False
+    else:
+        # 时间正常，更新最近运行时间
+        update_last_run_time()
+        return True
+
+
+# ---------------- 授权函数（集成时间防篡改） ----------------
 def get_machine_code():
     try:
         return f"{uuid.getnode():012X}"
@@ -47,6 +103,10 @@ def get_machine_code():
 
 
 def generate_auth_code(machine_code, valid_days=1):
+    # 生成授权码前先检查时间是否正常
+    if not check_time_tampering():
+        raise ValueError("系统时间异常，可能被篡改")
+
     expire_date = datetime.datetime.now() + datetime.timedelta(days=valid_days)
     expire_str = expire_date.strftime("%Y%m%d")
     data = f"{machine_code}|{expire_str}"
@@ -55,6 +115,10 @@ def generate_auth_code(machine_code, valid_days=1):
 
 
 def verify_auth_code(machine_code, auth_code_input, expire_str):
+    # 验证授权前先检查时间是否正常
+    if not check_time_tampering():
+        return False, "系统时间异常，可能被篡改"
+
     today_str = datetime.datetime.now().strftime("%Y%m%d")
     if today_str > str(expire_str):
         return False, "授权码已过期"
@@ -68,7 +132,6 @@ def verify_auth_code(machine_code, auth_code_input, expire_str):
 def save_auth_info(machine_code, auth_code, expire_str):
     try:
         info = {"machine_code": machine_code, "auth_code": auth_code, "expire": expire_str}
-        # 保存到用户目录（避免权限问题）
         user_dir = os.path.expanduser("~")
         auth_path = os.path.join(user_dir, AUTH_FILE)
         with open(auth_path, "w") as f:
@@ -91,6 +154,11 @@ def load_auth_info():
 
 
 def is_auth_valid():
+    # 检查授权有效性前先验证时间
+    if not check_time_tampering():
+        QMessageBox.critical(None, "时间异常", "系统时间可能被篡改，授权验证失败")
+        return False
+
     machine_code = get_machine_code()
     auth_info = load_auth_info()
     if auth_info and auth_info.get("machine_code") == machine_code:
@@ -171,6 +239,11 @@ class AuthDialog(QDialog):
             return
 
         try:
+            # 验证前先检查时间
+            if not check_time_tampering():
+                QMessageBox.critical(self, "时间异常", "系统时间可能被篡改，验证失败")
+                return
+
             expire_str = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%Y%m%d")
             valid, msg = verify_auth_code(machine_code, code_input, expire_str)
             if valid:
@@ -291,6 +364,11 @@ class PDFBrowser(QWidget):
             QMessageBox.critical(self, "加载错误", f"加载目录失败: {str(e)}")
 
     def open_encrypted_pdf(self, item, column):
+        # 打开文件前先检查时间是否正常
+        if not check_time_tampering():
+            QMessageBox.critical(self, "时间异常", "系统时间可能被篡改，无法打开文件")
+            return
+
         # 清理之前的临时文件
         self.clean_temp_file()
 
@@ -307,7 +385,7 @@ class PDFBrowser(QWidget):
                 QMessageBox.warning(self, "解密错误", "解密后文件为空")
                 return
 
-            # 在系统临时目录创建临时文件（避免权限问题）
+            # 在系统临时目录创建临时文件
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', mode='wb') as f:
                 f.write(decrypted_data)
                 self.temp_pdf = f.name
@@ -318,7 +396,7 @@ class PDFBrowser(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "打开失败", f"无法打开文件: {str(e)}")
-            self.clean_temp_file()  # 出错时清理临时文件
+            self.clean_temp_file()
 
     def get_encrypted_item_path(self, item):
         names = []
@@ -414,7 +492,7 @@ class PDFBrowser(QWidget):
             try:
                 os.remove(self.temp_pdf)
             except Exception as e:
-                print(f"清理临时文件失败: {str(e)}")  # 仅打印，不弹窗干扰用户
+                print(f"清理临时文件失败: {str(e)}")
         self.temp_pdf = None
         self.doc = None
 
@@ -426,6 +504,11 @@ class PDFBrowser(QWidget):
 # ---------------- 入口函数 ----------------
 def main():
     try:
+        # 程序启动时先检查时间是否正常
+        if not check_time_tampering():
+            QMessageBox.critical(None, "时间异常", "系统时间可能被篡改，程序无法启动")
+            sys.exit(1)
+
         app = QApplication(sys.argv)
         # 确保中文显示正常
         font = app.font()
