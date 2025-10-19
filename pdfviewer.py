@@ -478,7 +478,7 @@ class PDFBrowser(QWidget):
 
     def toggle_fullscreen(self):
         if self.fullscreen_flag:
-            self.showNormal()
+            self.showMaximized()
             self.splitter.widget(0).show()
             self.fullscreen_flag = False
         else:
